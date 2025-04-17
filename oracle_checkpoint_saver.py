@@ -9,6 +9,7 @@ in an Oracle Database using the oracledb driver.
 import json
 import uuid
 from typing import Any, Dict, Iterator, Optional, AsyncIterator, Sequence, Tuple
+from decimal import Decimal
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.base import (
     Checkpoint,
@@ -19,6 +20,8 @@ from langgraph.checkpoint.base import (
 )
 import oracledb
 from utils import get_console_logger
+
+from config import DEBUG
 
 # for connection to DB
 from config_private import CONNECT_ARGS
@@ -63,6 +66,21 @@ class OracleCheckpointSaver(BaseCheckpointSaver):
             # maybe we should re-raise here
             return None
 
+    def _sanitize_decimals(self, obj):
+        """
+        Recursively converts Decimal values in dicts/lists to int or float.
+
+        We need it because the sql query returns decimals
+        """
+        if isinstance(obj, dict):
+            return {k: self._sanitize_decimals(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._sanitize_decimals(v) for v in obj]
+        if isinstance(obj, Decimal):
+            return int(obj) if obj == int(obj) else float(obj)
+
+        return obj
+
     def put(
         self,
         config: RunnableConfig,
@@ -72,18 +90,17 @@ class OracleCheckpointSaver(BaseCheckpointSaver):
     ) -> RunnableConfig:
         """
         Inserts a new checkpoint or updates an existing one in the database.
+        Uses created_at to track the order of checkpoints.
         """
-        logger.info("OracleCheckpointSaver, called put...")
+        logger.info("OracleCheckpointSaver: called put...")
 
         thread_id = config["configurable"]["thread_id"]
-        # normally we don't set it in the config
         checkpoint_id = config["configurable"].get("checkpoint_id")
 
-        # If checkpoint_id is missing, generate a new UUID
         if not checkpoint_id:
+            logger.warning("Missing checkpoint_id in put(); generating fallback UUID.")
             checkpoint_id = str(uuid.uuid4())
             config.setdefault("configurable", {})["checkpoint_id"] = checkpoint_id
-            logger.info("Generated new checkpoint_id: %s", checkpoint_id)
 
         state_json = json.dumps(checkpoint)
         metadata_json = json.dumps(metadata)
@@ -109,11 +126,10 @@ class OracleCheckpointSaver(BaseCheckpointSaver):
                     },
                 )
 
-                # If no rows were updated, it is the first checkpoint for this thread, insert a new record
                 if cursor.rowcount == 0:
                     insert_sql = f"""
-                        INSERT INTO {TABLE_NAME} (thread_id, checkpoint_id, state, metadata)
-                        VALUES (:thread_id, :checkpoint_id, :state, :metadata)
+                        INSERT INTO {TABLE_NAME} (thread_id, checkpoint_id, state, metadata, created_at)
+                        VALUES (:thread_id, :checkpoint_id, :state, :metadata, CURRENT_TIMESTAMP)
                     """
                     cursor.execute(
                         insert_sql,
@@ -126,6 +142,13 @@ class OracleCheckpointSaver(BaseCheckpointSaver):
                     )
 
             conn.commit()
+
+        if DEBUG:
+            logger.info(
+                "Saving checkpoint ID %s: %s",
+                checkpoint_id,
+                json.dumps(checkpoint, indent=2),
+            )
 
         return config
 
@@ -146,39 +169,74 @@ class OracleCheckpointSaver(BaseCheckpointSaver):
             task_path (str, optional): Path of the task creating the writes.
         """
         # TODO Implement logic to store intermediate writes if necessary
-        logger.info("OracleCheckpointSaver, called put_writes...")
+        if DEBUG:
+            logger.info("OracleCheckpointSaver, called put_writes...")
 
     def get_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
         """
-        Retrieves a checkpoint tuple (state and metadata) from the database.
-        Requires a valid thread_id and checkpoint_id in the configuration.
+        Retrieves the most recent or specified checkpoint for a given thread.
+
+        If `checkpoint_id` is provided, retrieves that specific checkpoint.
+        Otherwise, selects the most recent checkpoint based on created_at.
+
+        All Decimal values are converted to native int or float.
         """
         logger.info("OracleCheckpointSaver: called get_tuple...")
 
         thread_id = config["configurable"]["thread_id"]
         checkpoint_id = config["configurable"].get("checkpoint_id")
 
-        # If checkpoint_id is missing, we can't retrieve the checkpoint
-        if not checkpoint_id:
-            logger.warning("Missing checkpoint_id in get_tuple(); returning None.")
-            return None
-
-        select_sql = f"""
-            SELECT state, metadata
-            FROM {TABLE_NAME}
-            WHERE thread_id = :thread_id AND checkpoint_id = :checkpoint_id
-        """
-
         with self.get_oracle_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    select_sql, {"thread_id": thread_id, "checkpoint_id": checkpoint_id}
-                )
+                if checkpoint_id:
+                    select_sql = f"""
+                        SELECT state, metadata
+                        FROM {TABLE_NAME}
+                        WHERE thread_id = :thread_id AND checkpoint_id = :checkpoint_id
+                    """
+                    cursor.execute(
+                        select_sql,
+                        {"thread_id": thread_id, "checkpoint_id": checkpoint_id},
+                    )
+                else:
+                    select_sql = f"""
+                        SELECT state, metadata
+                        FROM {TABLE_NAME}
+                        WHERE thread_id = :thread_id
+                        ORDER BY created_at DESC FETCH FIRST 1 ROWS ONLY
+                    """
+                    cursor.execute(select_sql, {"thread_id": thread_id})
+
                 row = cursor.fetchone()
                 if row:
-                    state = json.loads(row[0])
-                    metadata = json.loads(row[1])
-                    return CheckpointTuple(checkpoint=state, metadata=metadata)
+                    logger.info("Checkpoint row found!")
+                    state_raw, metadata_raw = row
+                    state = (
+                        json.loads(state_raw)
+                        if isinstance(state_raw, str)
+                        else state_raw
+                    )
+                    metadata = (
+                        json.loads(metadata_raw)
+                        if isinstance(metadata_raw, str)
+                        else metadata_raw
+                    )
+
+                    state = self._sanitize_decimals(state)
+                    metadata = self._sanitize_decimals(metadata)
+
+                    if DEBUG:
+                        logger.info(
+                            "Returning checkpoint ID: %s with channel_versions: %s",
+                            state.get("id"),
+                            state.get("channel_versions"),
+                        )
+
+                    return CheckpointTuple(
+                        checkpoint=state, metadata=metadata, config=config
+                    )
+
+        logger.info("No checkpoint row found — will restart from scratch!")
 
         return None
 
@@ -191,33 +249,56 @@ class OracleCheckpointSaver(BaseCheckpointSaver):
         limit: Optional[int] = None,
     ) -> Iterator[CheckpointTuple]:
         """
-        Lists checkpoints that match the given criteria.
+        Lists checkpoints for a given thread_id, ordered by created_at descending.
+        All Decimal values in state/metadata are converted to int/float.
 
         Args:
-            config (Optional[RunnableConfig], optional):
-                Base configuration for filtering checkpoints.
-            filter (Optional[Dict[str, Any]], optional):
-                Additional filtering criteria.
-            before (Optional[RunnableConfig], optional):
-                List checkpoints created before this configuration.
-            limit (Optional[int], optional): Maximum number of checkpoints to return.
-
-        Returns:
-            Iterator[CheckpointTuple]: Iterator of matching checkpoint tuples.
+            config: Configuration that may contain thread_id.
+            filter: Not used.
+            before: Optional checkpoint_id to filter out newer ones.
+            limit: Optional number of records to return.
         """
         thread_id = config["configurable"]["thread_id"] if config else None
-        select_sql = f"""
+        params = {"thread_id": thread_id}
+
+        base_sql = f"""
             SELECT state, metadata
             FROM {TABLE_NAME}
             WHERE thread_id = :thread_id
         """
+
+        if before:
+            before_id = before["configurable"].get("checkpoint_id")
+            if before_id:
+                base_sql += " AND checkpoint_id < :before_id"
+                params["before_id"] = before_id
+
+        base_sql += " ORDER BY created_at DESC"
+
+        if limit:
+            base_sql += f" FETCH FIRST {limit} ROWS ONLY"
+
         with self.get_oracle_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(select_sql, {"thread_id": thread_id})
+                cursor.execute(base_sql, params)
                 for row in cursor.fetchall():
-                    state = json.loads(row[0])
-                    metadata = json.loads(row[1])
-                    yield CheckpointTuple(checkpoint=state, metadata=metadata)
+                    state_raw, metadata_raw = row
+                    state = (
+                        json.loads(state_raw)
+                        if isinstance(state_raw, str)
+                        else state_raw
+                    )
+                    metadata = (
+                        json.loads(metadata_raw)
+                        if isinstance(metadata_raw, str)
+                        else metadata_raw
+                    )
+
+                    yield CheckpointTuple(
+                        checkpoint=self._sanitize_decimals(state),
+                        metadata=self._sanitize_decimals(metadata),
+                        config=config or {},
+                    )
 
     async def aput(
         self,
