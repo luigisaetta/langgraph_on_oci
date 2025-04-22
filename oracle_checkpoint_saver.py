@@ -4,6 +4,10 @@ oracle_checkpoint_saver.py
 This module provides the OracleCheckpointSaver class, which implements
 LangGraph's BaseCheckpointSaver interface to persist workflow state
 in an Oracle Database using the oracledb driver.
+
+Updates:
+- (19/04/2025) added connection pooling to improve performance.
+- (19/04/2025) added creation of the table if it doesn't exist.
 """
 
 import json
@@ -20,7 +24,6 @@ from langgraph.checkpoint.base import (
 )
 import oracledb
 from utils import get_console_logger
-
 from config import DEBUG
 
 # for connection to DB
@@ -45,32 +48,65 @@ class OracleCheckpointSaver(BaseCheckpointSaver):
         cursor (oracledb.Cursor): Cursor object for executing SQL statements.
     """
 
-    def __init__(self):
+    def __init__(self, min_connections=1, max_connections=5):
         """
-        Initializes the OracleCheckpointSaver
+        Initializes the OracleCheckpointSaver with a connection pool
+
+        Args:
+            min_connections: Minimum number of connections in the pool
+            max_connections: Maximum number of connections in the pool
         """
         super().__init__()
-
-    def get_oracle_connection(self):
-        """
-        Get the connection to the DB
-        """
+        self.pool = None
         try:
-            conn = oracledb.connect(
-                **CONNECT_ARGS,
+            self.pool = oracledb.create_pool(
+                min=min_connections, max=max_connections, **CONNECT_ARGS
             )
-
-            return conn
+            # ensure the tables exist
+            self._ensure_tables_exist()
         except oracledb.DatabaseError as e:
-            logger.error("Error connecting to Oracle DB: %s", e)
-            # maybe we should re-raise here
-            return None
+            logger.error("Error initializing connection pool: %s", e)
+            raise RuntimeError(f"Failed to initialize Oracle connection pool: {e}")
+
+    def __del__(self):
+        """Clean up resources when the object is destroyed"""
+        if self.pool:
+            try:
+                self.pool.close()
+            except Exception as e:
+                logger.error("Error closing connection pool: %s", e)
+
+    def _ensure_tables_exist(self):
+        """Ensures the required tables exist in the database"""
+        with self.pool.acquire() as conn:
+            with conn.cursor() as cursor:
+                # Check if checkpoints table exists
+                cursor.execute(
+                    "SELECT COUNT(*) FROM user_tables WHERE table_name = :name",
+                    {"name": TABLE_NAME},
+                )
+                if cursor.fetchone()[0] == 0:
+                    # Create the checkpoints table if it doesn't exist
+                    cursor.execute(
+                        f"""
+                        CREATE TABLE {TABLE_NAME} (
+                            thread_id VARCHAR2(64) NOT NULL,
+                            checkpoint_id VARCHAR2(64) NOT NULL,
+                            state JSON,
+                            metadata JSON,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY (thread_id, checkpoint_id)
+                        )
+                    """
+                    )
+
+                conn.commit()
 
     def _sanitize_decimals(self, obj):
         """
         Recursively converts Decimal values in dicts/lists to int or float.
 
-        We need it because the sql query returns decimals
+        We need it because the sql query fro number in Oracle returns decimals
         """
         if isinstance(obj, dict):
             return {k: self._sanitize_decimals(v) for k, v in obj.items()}
@@ -92,13 +128,17 @@ class OracleCheckpointSaver(BaseCheckpointSaver):
         Inserts a new checkpoint or updates an existing one in the database.
         Uses created_at to track the order of checkpoints.
         """
-        logger.info("OracleCheckpointSaver: called put...")
+        if DEBUG:
+            logger.info("OracleCheckpointSaver: called put...")
 
         thread_id = config["configurable"]["thread_id"]
         checkpoint_id = config["configurable"].get("checkpoint_id")
 
         if not checkpoint_id:
-            logger.warning("Missing checkpoint_id in put(); generating fallback UUID.")
+            if DEBUG:
+                logger.warning(
+                    "Missing checkpoint_id in put(); generating fallback UUID."
+                )
             checkpoint_id = str(uuid.uuid4())
             config.setdefault("configurable", {})["checkpoint_id"] = checkpoint_id
 
@@ -111,7 +151,7 @@ class OracleCheckpointSaver(BaseCheckpointSaver):
             WHERE thread_id = :thread_id AND checkpoint_id = :checkpoint_id
         """
 
-        with self.get_oracle_connection() as conn:
+        with self.pool.acquire() as conn:
             with conn.cursor() as cursor:
                 cursor.setinputsizes(
                     state=oracledb.DB_TYPE_JSON, metadata=oracledb.DB_TYPE_JSON
@@ -181,12 +221,13 @@ class OracleCheckpointSaver(BaseCheckpointSaver):
 
         All Decimal values are converted to native int or float.
         """
-        logger.info("OracleCheckpointSaver: called get_tuple...")
+        if DEBUG:
+            logger.info("OracleCheckpointSaver: called get_tuple...")
 
         thread_id = config["configurable"]["thread_id"]
         checkpoint_id = config["configurable"].get("checkpoint_id")
 
-        with self.get_oracle_connection() as conn:
+        with self.pool.acquire() as conn:
             with conn.cursor() as cursor:
                 if checkpoint_id:
                     select_sql = f"""
@@ -199,6 +240,7 @@ class OracleCheckpointSaver(BaseCheckpointSaver):
                         {"thread_id": thread_id, "checkpoint_id": checkpoint_id},
                     )
                 else:
+                    # get the last checkpoint for this thread_id
                     select_sql = f"""
                         SELECT state, metadata
                         FROM {TABLE_NAME}
@@ -236,7 +278,8 @@ class OracleCheckpointSaver(BaseCheckpointSaver):
                         checkpoint=state, metadata=metadata, config=config
                     )
 
-        logger.info("No checkpoint row found — will restart from scratch!")
+        if DEBUG:
+            logger.info("No checkpoint row found — will restart from scratch!")
 
         return None
 
@@ -273,12 +316,13 @@ class OracleCheckpointSaver(BaseCheckpointSaver):
                 base_sql += " AND checkpoint_id < :before_id"
                 params["before_id"] = before_id
 
+        # checkpoints are returned in reverse order of creation
         base_sql += " ORDER BY created_at DESC"
 
         if limit:
             base_sql += f" FETCH FIRST {limit} ROWS ONLY"
 
-        with self.get_oracle_connection() as conn:
+        with self.pool.acquire() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(base_sql, params)
                 for row in cursor.fetchall():
